@@ -1,0 +1,7 @@
+logs/*/*.bin
+logs/*/*/*.bin
+logs/*/*/*/*.bin
+logs/*/checkpoint-*/
+logs/*/samples/
+logs/*/logs
+real_reg/

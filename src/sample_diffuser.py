@@ -12,14 +12,23 @@ from diffusers import StableDiffusionPipeline
 from src import diffuser_training 
 from PIL import Image
 
-def sample(ckpt, delta_ckpt, from_file, prompt, compress, batch_size, freeze_model):
+from pdb import set_trace as Tra
+
+
+def sample(ckpt, delta_ckpt, from_file, prompt, compress, batch_size, freeze_model,
+           cones_lr, cones_tau,
+           lora_r, lora_alpha):
+    
     model_id = ckpt
     pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
+    # Tra()
 
     outdir = 'outputs/txt2img-samples'
     os.makedirs(outdir, exist_ok=True)
     if delta_ckpt is not None:
-        diffuser_training.load_model(pipe.text_encoder, pipe.tokenizer, pipe.unet, delta_ckpt, compress, freeze_model)
+        diffuser_training.load_model(pipe.text_encoder, pipe.tokenizer, pipe.unet, delta_ckpt, compress, freeze_model,
+                                     cones_lr, cones_tau,
+                                     lora_r, lora_alpha)
         outdir = os.path.dirname(delta_ckpt)
 
     all_images = []
@@ -65,9 +74,18 @@ def parse_args():
     parser.add_argument("--batch_size", default=5, type=int)
     parser.add_argument('--freeze_model', help='crossattn or crossattn_kv', default='crossattn_kv',
                         type=str)
-    return parser.parse_args()
+    
+    # for cones
+    parser.add_argument("--cones_lr", default=5e-6, type=float)
+    parser.add_argument("--cones_tau", default=250, type=float)
 
+    # for lora
+    parser.add_argument("--lora_r", type=int, default=8, help="")
+    parser.add_argument("--lora_alpha", type=int, default=16, help="")
+    return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-    sample(args.ckpt, args.delta_ckpt, args.from_file, args.prompt, args.compress, args.batch_size, args.freeze_model)
+    sample(args.ckpt, args.delta_ckpt, args.from_file, args.prompt, args.compress, args.batch_size, args.freeze_model, 
+           args.cones_lr, args.cones_tau, 
+           args.lora_r, args.lora_alpha)

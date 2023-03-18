@@ -247,8 +247,141 @@ from src import retrieve
 
 logger = get_logger(__name__)
 
+from pdb import set_trace as Tra
 
-def create_custom_diffusion(unet, freeze_model):
+import torch.nn as nn
+import copy
+
+
+# for wrapping crossattention class to inject lora
+class CrossAttentionWithLora(CrossAttention):
+    def __init__(
+        self,
+        query_dim: int,
+        cross_attention_dim: Optional[int] = None,
+        heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        bias=False,
+        upcast_attention: bool = False,
+        lora_r=8,
+        lora_alpha=16,
+        lora_dropout=0.0
+    ):
+        super().__init__(
+            query_dim,
+            cross_attention_dim,
+            heads,
+            dim_head,
+            dropout,
+            bias,
+            upcast_attention
+            )
+
+        # Tra()
+        self.to_k_lora_a = nn.Parameter(torch.zeros((lora_r, self.to_k.weight.size(1))))
+        self.to_k_lora_b = nn.Parameter(torch.zeros((self.to_k.weight.size(0), lora_r)))
+
+        self.to_v_lora_a = nn.Parameter(torch.zeros((lora_r, self.to_v.weight.size(1))))
+        self.to_v_lora_b = nn.Parameter(torch.zeros((self.to_v.weight.size(0), lora_r)))
+
+        nn.init.kaiming_uniform_(self.to_k_lora_a, a=math.sqrt(5))
+        nn.init.zeros_(self.to_k_lora_b)
+
+        nn.init.kaiming_uniform_(self.to_v_lora_a, a=math.sqrt(5))
+        nn.init.zeros_(self.to_v_lora_b)
+
+        if lora_dropout > 0.:
+            self.to_k_lora_dropout = nn.Dropout(p=lora_dropout)
+            self.to_v_lora_dropout = nn.Dropout(p=lora_dropout)
+        else:
+            self.to_k_lora_dropout = lambda x: x
+            self.to_v_lora_dropout = lambda x: x
+
+        self.scaling = lora_alpha / lora_r
+
+
+# for wrapping crossattention class to inject xi
+class CrossAttentionWithXi(CrossAttention):
+    def __init__(
+        self,
+        query_dim: int,
+        cross_attention_dim: Optional[int] = None,
+        heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        bias=False,
+        upcast_attention: bool = False,
+    ):
+        super().__init__(
+            query_dim,
+            cross_attention_dim,
+            heads,
+            dim_head,
+            dropout,
+            bias,
+            upcast_attention
+            )
+
+        self.k_xi = copy.deepcopy(self.to_k)
+        self.v_xi = copy.deepcopy(self.to_v)
+        nn.init.ones_(self.k_xi.weight)
+        nn.init.ones_(self.v_xi.weight)
+
+
+def create_custom_diffusion(unet, freeze_model, lora_r=8, lora_alpha=16, lora_dropout=0.0):
+
+    # replace CrossAttention Layer with CrossAttentionWithXi Layer
+    def get_layer(model, name):
+        layer = model
+        for attr in name.split("."):
+            layer = getattr(layer, attr)
+        return layer
+
+    def set_layer(model, name, layer):
+        try:
+            attrs, name = name.rsplit(".", 1)
+            model = get_layer(model, attrs)
+        except ValueError:
+            pass
+        setattr(model, name, layer)
+
+    if freeze_model == 'cones':
+        for name, module in unet.named_modules():
+            classname = module.__class__.__name__
+            # if 'CrossAttention' in classname:
+            if 'CrossAttention' in classname and 'attn2' in name: 
+                new_module = CrossAttentionWithXi(
+                    query_dim=module.to_q.weight.size(1),
+                    cross_attention_dim=module.to_k.weight.size(1),
+                    heads=module.heads,
+                    dim_head=int(module.to_q.weight.size(0)/module.heads),
+                    dropout=module.to_out[1].p,
+                    bias=False,
+                    upcast_attention=module.upcast_attention
+                )
+                new_module.load_state_dict(module.state_dict(), strict=False)
+                set_layer(unet, name, new_module)
+                
+    elif freeze_model == 'lora':
+        for name, module in unet.named_modules():
+            classname = module.__class__.__name__
+            if 'CrossAttention' in classname and 'attn2' in name: 
+                new_module = CrossAttentionWithLora(
+                    query_dim=module.to_q.weight.size(1),
+                    cross_attention_dim=module.to_k.weight.size(1),
+                    heads=module.heads,
+                    dim_head=int(module.to_q.weight.size(0)/module.heads),
+                    dropout=module.to_out[1].p,
+                    bias=False,
+                    upcast_attention=module.upcast_attention,
+                    lora_r=lora_r,
+                    lora_alpha=lora_alpha,
+                    lora_dropout=lora_dropout,
+                )
+                new_module.load_state_dict(module.state_dict(), strict=False)
+                set_layer(unet, name, new_module)
+
     for name, params in unet.named_parameters():
         if freeze_model == 'crossattn':
             if 'attn2' in name:
@@ -256,7 +389,19 @@ def create_custom_diffusion(unet, freeze_model):
                 print(name)
             else:
                 params.requires_grad = False
-        else:
+        elif freeze_model == 'cones':
+            if 'xi' in name:
+                params.requires_grad = True
+                print(name)
+            else:
+                params.requires_grad = False
+        elif freeze_model == 'lora':
+            if 'lora' in name:
+                params.requires_grad = True
+                print(name)
+            else:
+                params.requires_grad = False
+        elif freeze_model == 'crossattn_kv':
             if 'attn2.to_k' in name or 'attn2.to_v' in name:
                 params.requires_grad = True
                 print(name)
@@ -278,6 +423,26 @@ def create_custom_diffusion(unet, freeze_model):
         context = context if context is not None else hidden_states
         key = self.to_k(context)
         value = self.to_v(context)
+
+        '''
+        (Pdb) query.size(); context.size()
+        torch.Size([2, 4096, 320])
+        torch.Size([2, 4096, 320])
+        '''
+
+        # if CrossAttention Layer has xi, perform elementwise matmul before projection
+        if hasattr(self, 'k_xi'):
+            key = context @ torch.transpose(self.to_k.weight * self.k_xi.weight, 0, 1)
+            value = context @ torch.transpose(self.to_v.weight * self.v_xi.weight, 0, 1)
+        elif hasattr(self, 'to_k_lora_a'):
+            key = self.to_k(context)
+            value = self.to_v(context)
+            # Tra()
+            key += (self.to_k_lora_dropout(context) @ self.to_k_lora_a.T @ self.to_k_lora_b.T) * self.scaling
+            value += (self.to_v_lora_dropout(context) @ self.to_v_lora_a.T @ self.to_v_lora_b.T) * self.scaling
+        else:
+            key = self.to_k(context)
+            value = self.to_v(context)
 
         if crossattn:
             modifier = torch.ones_like(key)
@@ -313,7 +478,7 @@ def create_custom_diffusion(unet, freeze_model):
 
     def change_forward(unet):
         for layer in unet.children():
-            if type(layer) == CrossAttention:
+            if type(layer) in [CrossAttention, CrossAttentionWithXi, CrossAttentionWithLora]:
                 bound_method = new_forward.__get__(layer, layer.__class__)
                 setattr(layer, 'forward', bound_method)
             else:
@@ -336,15 +501,27 @@ def save_progress(text_encoder, unet, modifier_token_id, accelerator, args, save
         if args.freeze_model == 'crossattn':
             if 'attn2' in name:
                 delta_dict['unet'][name] = params.cpu().clone()
-        else:
+        elif args.freeze_model == 'cones':
+            # raise NotImplementedError
+            if 'xi' in name:
+                delta_dict['unet'][name] = params.cpu().clone()
+        elif args.freeze_model == 'lora':
+            if 'lora' in name:
+                delta_dict['unet'][name] = params.cpu().clone()
+        elif args.freeze_model == 'crossattn_kv':
             if 'attn2.to_k' in name or 'attn2.to_v' in name:
                 delta_dict['unet'][name] = params.cpu().clone()
 
     torch.save(delta_dict, save_path)
 
 
-def load_model(text_encoder, tokenizer, unet, save_path, compress=False, freeze_model='crossattn_kv'):
+def load_model(text_encoder, tokenizer, unet, save_path, compress=False, freeze_model='crossattn_kv',
+               cones_lr = None, cones_tau=250, lora_r=8, lora_alpha=16):
+    
+    lora_scaling = lora_alpha / lora_r
+    
     st = torch.load(save_path)
+
     if 'text_encoder' in st:
         text_encoder.load_state_dict(st['text_encoder'])
     if 'modifier_token' in st:
@@ -362,6 +539,7 @@ def load_model(text_encoder, tokenizer, unet, save_path, compress=False, freeze_
             token_embeds[id_] = st['modifier_token'][modifier_tokens[i]]
 
     print(st.keys())
+    stats = []
     for name, params in unet.named_parameters():
         if freeze_model == 'crossattn':
             if 'attn2' in name:
@@ -369,13 +547,117 @@ def load_model(text_encoder, tokenizer, unet, save_path, compress=False, freeze_
                     params.data += st['unet'][name]['u']@st['unet'][name]['v']
                 else:
                     params.data.copy_(st['unet'][f'{name}'])
-        else:
+                    
+        elif freeze_model == 'cones':
+            # if 'to_k' in name or 'to_v' in name:
+            if 'attn2.to_k' in name or 'attn2.to_v' in name:
+                if compress:
+                    raise NotImplementedError
+                else:
+                    # raise NotImplementedError
+                    if 'to_k' in name:
+                        key = '.'.join(name.split('.')[:-2]) + '.k_xi.weight'
+                    elif 'to_v' in name:
+                        key = '.'.join(name.split('.')[:-2]) + '.v_xi.weight'
+                    xi = st['unet'][key]
+                    
+                    m = ~(xi < (1 - cones_lr*cones_tau)) # 91.82
+                    # m = (m * xi) # do we need to scaling ? (not in paper)
+                    
+                    '''
+                    concept neurons are environmentally friendly as we only need to store a sparse cluster of int index 
+                    instead of dense float32 values of the parameters
+                    '''
+
+                    params.data.copy_(params * m.type_as(params))
+
+                    stats.append(
+                        {
+                            'name' : name,
+                            'num_neurons' : params.numel(),
+                            'activated_neurons' : (m!=0).sum().item(),
+                        }
+                    )
+        
+        elif freeze_model == 'lora':
+            if 'attn2.to_k' in name or 'attn2.to_v' in name:
+                if compress:
+                    raise NotImplementedError
+                else:
+                    if 'to_k' in name:
+                        lora_a_key = '.'.join(name.split('.')[:-2]) + '.to_k_lora_a'
+                        lora_b_key = '.'.join(name.split('.')[:-2]) + '.to_k_lora_b'
+                    if 'to_v' in name:
+                        lora_a_key = '.'.join(name.split('.')[:-2]) + '.to_v_lora_a'
+                        lora_b_key = '.'.join(name.split('.')[:-2]) + '.to_v_lora_b'
+
+                    params.data += (st['unet'][lora_b_key] @ st['unet'][lora_a_key]).type_as(params) * lora_scaling
+
+        elif freeze_model == 'crossattn_kv':
             if 'attn2.to_k' in name or 'attn2.to_v' in name:
                 if compress:
                     params.data += st['unet'][name]['u']@st['unet'][name]['v']
                 else:
                     params.data.copy_(st['unet'][f'{name}'])
 
+    '''
+    # custom diffusion
+    (Pdb) unet.up_blocks[2].attentions[1].transformer_blocks[0].attn2.to_v.weight
+    Parameter containing:
+    tensor([[-0.0142, -0.0330, -0.0289,  ...,  0.0398, -0.0098,  0.0267],
+            [ 0.0435, -0.0482, -0.0019,  ...,  0.0315, -0.0167,  0.0408],
+            [-0.0003,  0.0529,  0.0226,  ..., -0.0131, -0.0195, -0.0210],
+            ...,
+            [-0.0371,  0.0851, -0.1412,  ...,  0.0433, -0.0572, -0.0812],
+            [-0.0639,  0.0135,  0.0798,  ...,  0.0093, -0.0095, -0.0067],
+            [ 0.0642,  0.1019, -0.0458,  ..., -0.0095, -0.0334,  0.0333]],
+        device='cuda:0', dtype=torch.float16, requires_grad=True)
+    (Pdb) unet.up_blocks[2].attentions[1].transformer_blocks[0].attn2.to_v.weight.mean().item(); unet.up_blocks[2].attentions[1].transformer_blocks[0].attn2.to_v.weight.std().item()
+    -9.59634780883789e-05
+    0.037109375
+
+    # cones
+    (Pdb) unet.up_blocks[2].attentions[1].transformer_blocks[0].attn2.to_v.weight
+    Parameter containing:
+    tensor([[-0.0000, -0.0000, -0.0224,  ...,  0.0000, -0.0014,  0.0187],
+            [ 0.0433, -0.0433,  0.0000,  ...,  0.0304, -0.0111,  0.0000],
+            [-0.0003,  0.0457,  0.0161,  ..., -0.0000, -0.0000, -0.0000],
+            ...,
+            [-0.0345,  0.0000, -0.0000,  ...,  0.0000, -0.0000, -0.0791],
+            [-0.0000,  0.0098,  0.0000,  ...,  0.0000, -0.0000, -0.0000],
+            [ 0.0000,  0.1011, -0.0000,  ..., -0.0055, -0.0000,  0.0331]],
+        device='cuda:0', dtype=torch.float16, requires_grad=True)
+    (Pdb) unet.up_blocks[2].attentions[1].transformer_blocks[0].attn2.to_v.weight.mean().item(); unet.up_blocks[2].attentions[1].transformer_blocks[0].attn2.to_v.weight.std().item()
+    -4.07099723815918e-05
+    0.025299072265625
+    '''
+
+    # Tra()
+    if freeze_model == 'cones':
+        print('cones_lr', cones_lr)
+        print('cones_tau', cones_tau)
+        activated_neurons = 0
+        num_neurons = 0
+        for s in stats:
+            print(
+                '{} : {}'.format(
+                    s['name'], 
+                    round(s['activated_neurons']/s['num_neurons']*100, 2)
+                    )
+                )
+            activated_neurons += s['activated_neurons']
+            num_neurons += s['num_neurons']
+        print(
+            'total activated neurons : {} ({}/{})'.format(
+                round(activated_neurons/num_neurons*100, 2),
+                activated_neurons,
+                num_neurons
+                )
+            )
+    '''
+    Here sparsity means the percentage of concept neurons in all the neurons of the attention layers. 
+    We can find that Cones costs much less storage compared with the competitors.
+    '''
 
 def freeze_params(params):
     for param in params:
@@ -599,6 +881,12 @@ def parse_args(input_args=None):
         "--initializer_token", type=str, default='ktn+pll+ucd', help="A token to use as initializer word."
     )
     parser.add_argument("--hflip", action="store_true", help="Apply horizontal flip data augmentation.")
+
+    # for lora
+    parser.add_argument("--lora_r", type=int, default=8, help="")
+    parser.add_argument("--lora_alpha", type=int, default=16, help="")
+    parser.add_argument("--lora_dropout", type=int, default=0.0, help="")
+
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -955,8 +1243,28 @@ def main(args):
     else:
         optimizer_class = torch.optim.AdamW
 
-    unet = create_custom_diffusion(unet, args.freeze_model)
-    
+    unet = create_custom_diffusion(
+        unet, 
+        args.freeze_model,
+        args.lora_r,
+        args.lora_alpha,
+        args.lora_dropout
+    )
+
+    # Tra()
+    '''
+    (Pdb) unet.up_blocks[2].attentions[1].transformer_blocks[0].attn2.to_v.weight
+    Parameter containing:
+    tensor([[-0.0178, -0.0281, -0.0224,  ...,  0.0391, -0.0014,  0.0187],
+            [ 0.0433, -0.0433,  0.0025,  ...,  0.0304, -0.0111,  0.0375],
+            [-0.0003,  0.0457,  0.0161,  ..., -0.0073, -0.0267, -0.0158],
+            ...,
+            [-0.0344,  0.0861, -0.1406,  ...,  0.0407, -0.0540, -0.0791],
+            [-0.0704,  0.0098,  0.0769,  ...,  0.0155, -0.0111, -0.0144],
+            [ 0.0598,  0.1011, -0.0524,  ..., -0.0055, -0.0349,  0.0331]])
+    '''
+
+
     # Adding a modifier token which is optimized ####
     # Code taken from https://github.com/huggingface/diffusers/blob/main/examples/textual_inversion/textual_inversion.py
     modifier_token_id = []
@@ -1003,7 +1311,14 @@ def main(args):
 
         if args.freeze_model == 'crossattn':
             params_to_optimize = itertools.chain( text_encoder.get_input_embeddings().parameters() , [x[1] for x in unet.named_parameters() if 'attn2' in x[0]] )
-        else:
+        elif args.freeze_model == 'cones':
+            unet_param_list = [x[1] for x in unet.named_parameters() if ('xi' in x[0])]
+            params_to_optimize = itertools.chain( text_encoder.get_input_embeddings().parameters() ,  unet_param_list)
+        elif args.freeze_model == 'lora':
+            # Tra()
+            unet_param_list = [x[1] for x in unet.named_parameters() if ('lora' in x[0])]
+            params_to_optimize = itertools.chain( text_encoder.get_input_embeddings().parameters() ,  unet_param_list)
+        elif args.freeze_model == 'crossattn_kv':
             params_to_optimize = itertools.chain( text_encoder.get_input_embeddings().parameters() , [x[1] for x in unet.named_parameters() if ('attn2.to_k' in x[0] or 'attn2.to_v' in x[0])] )
 
     ########################################################
@@ -1013,7 +1328,17 @@ def main(args):
             params_to_optimize = (
                 itertools.chain([x[1] for x in unet.named_parameters() if 'attn2' in x[0]], text_encoder.parameters() if args.train_text_encoder else [] ) 
             )
-        else:
+        elif args.freeze_model == 'cones':
+            unet_param_list = [x[1] for x in unet.named_parameters() if ('xi' in x[0])]
+            params_to_optimize = (
+                itertools.chain(unet_param_list, text_encoder.parameters() if args.train_text_encoder else [] ) 
+            )
+        elif args.freeze_model == 'lora':
+            unet_param_list = [x[1] for x in unet.named_parameters() if ('lora' in x[0])]
+            params_to_optimize = (
+                itertools.chain(unet_param_list, text_encoder.parameters() if args.train_text_encoder else [] ) 
+            )
+        elif args.freeze_model == 'crossattn_kv':
             params_to_optimize = (
                 itertools.chain([x[1] for x in unet.named_parameters() if ('attn2.to_k' in x[0] or 'attn2.to_v' in x[0])], text_encoder.parameters() if args.train_text_encoder else [] ) 
             )
@@ -1192,6 +1517,7 @@ def main(args):
 
                 accelerator.backward(loss)
 
+
                 # Zero out the gradients for all token embeddings except the newly added
                 # embeddings for the concept, as we only want to optimize the concept embeddings
                 if args.modifier_token is not None:
@@ -1206,11 +1532,26 @@ def main(args):
                     grads_text_encoder.data[index_grads_to_zero, :] = grads_text_encoder.data[index_grads_to_zero, :].fill_(0)
 
                 if accelerator.sync_gradients:
-                    params_to_clip = (
-                        itertools.chain([x[1] for x in unet.named_parameters() if ('attn2.to_k' in x[0] or 'attn2.to_v' in x[0])], text_encoder.parameters())
-                        if (args.train_text_encoder or args.modifier_token is not None)
-                        else itertools.chain([x[1] for x in unet.named_parameters() if ('attn2.to_k' in x[0] or 'attn2.to_v' in x[0])]) 
-                    )
+                    if args.freeze_model == 'cones':
+                        unet_param_list = [x[1] for x in unet.named_parameters() if ('xi' in x[0])]
+                        params_to_clip = (
+                            itertools.chain(unet_param_list, text_encoder.parameters())
+                            if (args.train_text_encoder or args.modifier_token is not None)
+                            else itertools.chain(unet_param_list) 
+                        )
+                    elif args.freeze_model == 'lora':
+                        unet_param_list = [x[1] for x in unet.named_parameters() if ('lora' in x[0])]
+                        params_to_clip = (
+                            itertools.chain(unet_param_list, text_encoder.parameters())
+                            if (args.train_text_encoder or args.modifier_token is not None)
+                            else itertools.chain(unet_param_list) 
+                        )
+                    else:
+                        params_to_clip = (
+                            itertools.chain([x[1] for x in unet.named_parameters() if ('attn2.to_k' in x[0] or 'attn2.to_v' in x[0])], text_encoder.parameters())
+                            if (args.train_text_encoder or args.modifier_token is not None)
+                            else itertools.chain([x[1] for x in unet.named_parameters() if ('attn2.to_k' in x[0] or 'attn2.to_v' in x[0])]) 
+                        )
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()

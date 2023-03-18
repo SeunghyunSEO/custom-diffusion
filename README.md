@@ -1,3 +1,24 @@
+# LoRA vs Custom Diffusion vs Concept Neurons
+
+<br>
+<div class="gif">
+<p align="center">
+<img src='assets/comparison.png' align="center" width=800>
+</p>
+</div>
+
+<br>
+<div class="gif">
+<p align="center">
+<img src='assets/cones_sparsity_0.09.png' align="center" width=800>
+</p>
+</div>
+
+... tuning $\tau$ is hard
+
+***
+
+
 # Custom Diffusion
 
 ### [website](https://www.cs.cmu.edu/~custom-diffusion/)  | [paper](http://arxiv.org/abs/2212.04488) | [gradio demo](https://huggingface.co/spaces/nupurkmr9/custom-diffusion)
