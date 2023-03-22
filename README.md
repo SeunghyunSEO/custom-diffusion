@@ -1,14 +1,20 @@
 # LoRA vs Custom Diffusion vs Concept Neurons
 
+- [x] naive lora 
+- [x] naive concept neuron
+- [ ] save policy for binary concept neuron mask using indexes
+- [ ] concept neuron for multi concept
+
+
 <br>
-<div class="gif">
+<div class="png">
 <p align="center">
 <img src='assets/comparison.png' align="center" width=800>
 </p>
 </div>
 
 <br>
-<div class="gif">
+<div class="png">
 <p align="center">
 <img src='assets/cones_sparsity_0.09.png' align="center" width=800>
 </p>
